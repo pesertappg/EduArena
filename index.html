@@ -53,30 +53,98 @@ body:after{width:420px;height:420px;right:-170px;bottom:-120px;background:radial
 </style>
 </head>
 <body><main id="app"></main>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 'use strict';
+const SUPABASE_URL='https://pcwxomxkwylpcdwddavt.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY='sb_publishable_BokmgnnwISV8WtqWIBPf0w_L2FuVV6g';
+const supabaseClient=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY);
 const KEY='eduarena_v2';
 const ARENAS=[
 {id:'radar',icon:'📡',name:'Radar Arena',desc:'Memetakan pengetahuan awal melalui pertanyaan pemantik.',color:'#0794a8'},
 {id:'rakit',icon:'🧩',name:'Rakit Kalimat',desc:'Menyusun kembali kata menjadi kalimat dari materi.',color:'#e58a18'},
 {id:'tanding',icon:'⚔️',name:'Tanding',desc:'Aktivitas kelompok dengan hasil akhir ditampilkan setelah selesai.',color:'#d6425b'},
 ];
-let data=load(), page=data.session?'home':'login', currentArena=null,currentMaterial=null,state={};
+let data=load(), page='login', currentArena=null,currentMaterial=null,state={},cloudBusy=false;
+data.session=null;
 function load(){try{return JSON.parse(localStorage.getItem(KEY))||{users:{},session:null,materials:{}}}catch(e){return{users:{},session:null,materials:{}}}}
 function save(){localStorage.setItem(KEY,JSON.stringify(data))}
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function app(){document.getElementById('app').innerHTML=views[page]?views[page]():views.home()}
 function go(p){page=p;app();window.scrollTo(0,0)}
 function materials(){return data.materials[data.session]||[]}
-function login(){
- const u=document.getElementById('user').value.trim().toLowerCase(),p=document.getElementById('pass').value,e=document.getElementById('loginErr');
- if(u.length<3||p.length<4){e.textContent='Username minimal 3 karakter dan password minimal 4 karakter.';return}
- if(data.users[u]&&data.users[u]!==p){e.textContent='Username sudah terdaftar dengan password berbeda. Gunakan username lain atau password yang benar.';return}
- data.users[u]=p;data.session=u;if(!data.materials[u])data.materials[u]=[];save();go('home')
+function usernameEmail(username){return `${username}@login.eduarena.app`}
+function setLoginMessage(message){const e=document.getElementById('loginErr');if(e)e.textContent=message}
+async function loadCloudMaterials(username,migrateLocal=false){
+ const {data:rows,error}=await supabaseClient.from('materials').select('id,title,content,created_at').order('created_at',{ascending:true});
+ if(error)throw error;
+ let list=rows||[];
+ const localList=data.materials[username]||[];
+ if(migrateLocal&&list.length===0&&localList.length){
+   const payload=localList.map(m=>({title:m.title,content:m.text}));
+   const {error:insertError}=await supabaseClient.from('materials').insert(payload);
+   if(insertError)throw insertError;
+   const {data:newRows,error:reloadError}=await supabaseClient.from('materials').select('id,title,content,created_at').order('created_at',{ascending:true});
+   if(reloadError)throw reloadError;
+   list=newRows||[];
+ }
+ data.materials[username]=list.map(m=>({id:m.id,title:m.title,text:m.content}));
+ data.session=username;
+ // Supabase now handles passwords. Remove any legacy plaintext passwords from local storage.
+ data.users={};
+ save();
 }
-function logout(){data.session=null;save();go('login')}
-function addMaterial(){const title=document.getElementById('mtitle').value.trim(),text=document.getElementById('mtext').value.trim();if(!title||!text){alert('Isi judul dan isi materi terlebih dahulu.');return}materials().push({id:Date.now().toString(),title,text});save();go('home')}
-function removeMaterial(id){data.materials[data.session]=materials().filter(m=>m.id!==id);save();go('home')}
+async function login(){
+ if(cloudBusy)return;
+ const u=document.getElementById('user').value.trim().toLowerCase(),p=document.getElementById('pass').value;
+ if(u.length<3||p.length<4){setLoginMessage('Username minimal 3 karakter dan password minimal 4 karakter.');return}
+ if(!/^[a-z0-9._-]+$/.test(u)){setLoginMessage('Username hanya boleh memakai huruf a-z, angka, titik, garis bawah, atau tanda hubung.');return}
+ cloudBusy=true;setLoginMessage('Menghubungkan ke EduArena...');
+ try{
+   let result=await supabaseClient.auth.signInWithPassword({email:usernameEmail(u),password:p});
+   if(result.error){
+     const signup=await supabaseClient.auth.signUp({email:usernameEmail(u),password:p});
+     if(signup.error){
+       const msg=String(signup.error.message||'').toLowerCase();
+       if(msg.includes('already registered')||msg.includes('already exists')||msg.includes('user already'))throw new Error('Username sudah terdaftar. Periksa password Anda.');
+       if(msg.includes('confirm')||msg.includes('email'))throw new Error('Pendaftaran belum berhasil. Pastikan konfirmasi email dinonaktifkan pada pengaturan Supabase Authentication.');
+       throw signup.error;
+     }
+     if(!signup.data.session)throw new Error('Akun dibuat, tetapi sesi login belum tersedia. Pastikan Confirm email dinonaktifkan di Supabase Authentication, lalu coba masuk lagi.');
+     result=signup;
+   }
+   if(result.error)throw result.error;
+   await loadCloudMaterials(u,true);
+   go('home');
+ }catch(err){
+   const msg=String(err?.message||'');
+   setLoginMessage(msg.includes('Failed to fetch')?'Tidak dapat menghubungi Supabase. Periksa koneksi internet dan Project URL.':msg||'Login gagal. Silakan coba lagi.');
+ }finally{cloudBusy=false;const b=document.querySelector('.form .btn');if(b)b.disabled=false;}
+}
+async function logout(){await supabaseClient.auth.signOut();data.session=null;save();go('login')}
+async function addMaterial(){
+ const title=document.getElementById('mtitle').value.trim(),text=document.getElementById('mtext').value.trim();
+ if(!title||!text){alert('Isi judul dan isi materi terlebih dahulu.');return}
+ const {data:row,error}=await supabaseClient.from('materials').insert({title,content:text}).select('id,title,content').single();
+ if(error){alert('Materi belum tersimpan di cloud: '+error.message);return}
+ materials().push({id:row.id,title:row.title,text:row.content});save();go('home');
+}
+async function removeMaterial(id){
+ const {error}=await supabaseClient.from('materials').delete().eq('id',id);
+ if(error){alert('Materi belum dapat dihapus: '+error.message);return}
+ data.materials[data.session]=materials().filter(m=>m.id!==id);save();go('home');
+}
+async function bootCloud(){
+ try{
+   const {data:sessionData,error}=await supabaseClient.auth.getSession();
+   if(error||!sessionData.session)return;
+   const email=sessionData.session.user.email||'';
+   const suffix='@login.eduarena.app';
+   if(!email.endsWith(suffix))return;
+   const u=email.slice(0,-suffix.length);
+   await loadCloudMaterials(u,false);go('home');
+ }catch(err){console.error('EduArena cloud session:',err);}
+}
 function selectArena(id){if(!materials().length){alert('Tambahkan materi terlebih dahulu.');return}currentArena=id;currentMaterial=null;state={};go('material')}
 function selectMaterial(id){currentMaterial=materials().find(m=>m.id===id);state={};go(currentArena)}
 function sentences(t){return t.split(/(?<=[.!?])\s+|\n+/).map(x=>x.trim()).filter(Boolean)}
@@ -237,7 +305,7 @@ function cariStart(){
 function cariGuess(){const x=(document.getElementById('guess')?.value||'').trim().toLowerCase();if(!x)return;if(state.targets.includes(x)&&!state.found.includes(x)){state.found.push(x);state.cariMsg='✓ Kata ditemukan.';app()}else{state.cariMsg='✕ Kata tersebut tidak termasuk kata kunci yang tersedia.';app()}}
 function submitTanding(){const v=(document.getElementById('tans')?.value||'').trim();if(!v)return;const q=state.qs[state.i];const ok=v.localeCompare(q.a,{sensitivity:'base',ignorePunctuation:true})===0;state.feedback={ok,opt:v};if(ok)state.scores[state.groups[state.i%state.groups.length]]++;app()}
 const views={
-login(){return `<div class="wrap"><div class="form"><div class="brand">EduArena<small>Pembelajaran Mendalam</small></div><div class="card" style="margin-top:18px"><h1>Masuk / Daftar</h1><p class="muted">Satu pintu untuk menyimpan materi di browser ini.</p><label>Username</label><input class="input" id="user" autocomplete="username" placeholder="Username"><label>Password</label><input class="input" id="pass" type="password" autocomplete="current-password" placeholder="Password" onkeydown="if(event.key==='Enter')login()"><div class="err" id="loginErr"></div><button class="btn" onclick="login()">Masuk / Daftar</button><p class="login-note">Username baru otomatis dibuat. Jika username sudah ada, password harus benar.</p></div></div></div>`},
+login(){return `<div class="wrap"><div class="form"><div class="brand">EduArena<small>Pembelajaran Mendalam</small></div><div class="card" style="margin-top:18px"><h1>Masuk / Daftar</h1><p class="muted">Masuk dengan username untuk menyimpan materi di cloud dan mengaksesnya dari perangkat lain.</p><label>Username</label><input class="input" id="user" autocomplete="username" placeholder="Username"><label>Password</label><input class="input" id="pass" type="password" autocomplete="current-password" placeholder="Password" onkeydown="if(event.key==='Enter')login()"><div class="err" id="loginErr"></div><button class="btn" onclick="login()">Masuk / Daftar</button><p class="login-note">Username baru otomatis dibuat. Jika username sudah ada, password harus benar.</p></div></div></div>`},
 home(){return `<div class="wrap"><div class="top"><div class="brand">EduArena<small>Ubah materi menjadi aktivitas belajar</small></div><div class="row"><span class="pill">👤 ${esc(data.session)}</span><button class="btn alt" onclick="logout()">Keluar</button></div></div><section class="hero"><h1>Belajar lebih bermakna.</h1><p>Belajar, Bermain, Berkembang!</p><div class="tags"><span class="tag">🧘 Berkesadaran</span><span class="tag">💡 Bermakna</span><span class="tag">🎉 Menggembirakan</span></div></section><div class="grid">${ARENAS.map(a=>`<button class="card arena" onclick="selectArena('${a.id}')" style="border-top:5px solid ${a.color}"><span class="ico">${a.icon}</span><h3>${a.name}</h3><span class="muted">${a.desc}</span></button>`).join('')}</div><section class="section"><div class="row between"><h2>📚 Materi Saya</h2><span class="badge">${materials().length} materi</span></div><div class="card"><input class="input" id="mtitle" placeholder="Judul materi"><textarea class="area" id="mtext" rows="6" placeholder="Tempel isi materi di sini..."></textarea><button class="btn" onclick="addMaterial()">+ Simpan Materi</button></div><div class="list">${materials().map(m=>`<div class="card material"><div><b>${esc(m.title)}</b><div class="muted">${esc(m.text.slice(0,150))}${m.text.length>150?'…':''}</div></div><button class="btn alt" onclick="removeMaterial('${m.id}')">Hapus</button></div>`).join('')||'<div class="card muted">Belum ada materi.</div>'}</div></section></div>`},
 material(){const a=ARENAS.find(x=>x.id===currentArena);return `<div class="wrap"><div class="top"><button class="btn alt" onclick="go('home')">← Beranda</button><div class="brand">${a.icon} ${a.name}<small>Pilih materi</small></div></div><div class="list">${materials().map(m=>`<div class="card material"><div><b>${esc(m.title)}</b><div class="muted">${esc(m.text.slice(0,180))}${m.text.length>180?'…':''}</div></div><button class="btn" onclick="selectMaterial('${m.id}')">Pilih →</button></div>`).join('')}</div></div>`},
 radar(){return `<div class="wrap"><div class="top"><button class="btn alt" onclick="go('material')">← Materi</button><div class="brand">📡 Radar Arena</div></div><div class="card"><h2>${esc(currentMaterial.title)}</h2><label>Jumlah pertanyaan: <b id="cv">6</b></label><input type="range" min="1" max="12" value="6" oninput="state.count=+this.value;document.getElementById('cv').textContent=this.value"><label>Nama siswa, satu nama per baris</label><textarea class="area" id="names" rows="7" placeholder="Masukkan nama siswa..."></textarea><button class="btn" onclick="radarStart()">Mulai Radar</button></div></div>`},
@@ -259,4 +327,5 @@ tandingEnd(){
  return `<div class="wrap"><div class="top"><button class="btn alt" onclick="go('home')">← Beranda</button><div class="brand">🏁 Tanding Selesai</div></div><div class="card" style="text-align:center"><h2>${title}</h2><p class="muted">${subtitle}</p></div><div class="card"><h3 style="margin-top:0">📊 Peringkat</h3>${rows||'<p class="muted">Belum ada hasil.</p>'}</div><div class="row" style="margin-top:14px"><button class="btn" onclick="go('tanding')">Main Lagi</button><button class="btn alt" onclick="go('home')">Kembali ke Beranda</button></div></div>`},
 };
 app();
+bootCloud();
 </script></body></html>
